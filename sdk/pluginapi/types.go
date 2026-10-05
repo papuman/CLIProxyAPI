@@ -522,6 +522,16 @@ type SchedulerAuthCandidate struct {
 	Attributes map[string]string
 	// Metadata contains mutable host-managed auth metadata.
 	Metadata map[string]any
+	// Quota contains the latest passive upstream quota observation, without credentials.
+	Quota SchedulerQuotaSnapshot
+}
+
+// SchedulerQuotaSnapshot exposes quota watermarks, not host cooldown state.
+type SchedulerQuotaSnapshot struct {
+	// ObservedAt anchors relative reset times in Signals.
+	ObservedAt time.Time `json:"observed_at,omitempty"`
+	// Signals contains provider-specific quota headers from one upstream response.
+	Signals map[string]string `json:"signals,omitempty"`
 }
 
 // SchedulerPickResponse returns a scheduler plugin routing decision.

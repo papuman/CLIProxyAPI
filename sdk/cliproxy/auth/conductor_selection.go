@@ -859,12 +859,17 @@ func schedulerAuthCandidates(auths []*Auth) []pluginapi.SchedulerAuthCandidate {
 		if auth == nil {
 			continue
 		}
+		quota := auth.Quota.Clone()
 		out = append(out, pluginapi.SchedulerAuthCandidate{
 			ID:         auth.ID,
 			Provider:   strings.ToLower(strings.TrimSpace(auth.Provider)),
 			Priority:   authPriority(auth),
 			Status:     string(auth.Status),
 			Attributes: schedulerSafeAttributes(auth.Attributes),
+			Quota: pluginapi.SchedulerQuotaSnapshot{
+				ObservedAt: quota.ObservedAt,
+				Signals:    quota.Signals,
+			},
 		})
 	}
 	return out
