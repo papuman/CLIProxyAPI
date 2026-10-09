@@ -60,6 +60,9 @@ USAGE_PATH = "/api/oauth/usage?cedar_ember=1&skip_spend=1"
 WINDOWS = {"five_hour": "5h", "seven_day": "7d"}
 # Anthropic answers 429 when one account's usage is read more often than about every 3 min.
 READ_GAP_S = 200
+# A used-up weekly window stays used up until its fixed end date, so re-reading it often
+# only spends the per-account read budget the dashboard also needs.
+FULL_REREAD_S = 15 * 60
 IMMINENT_EXPIRY_S = 5 * 60
 
 
@@ -366,7 +369,8 @@ class Keeper:
 
     def read_usage(self, cred: dict, now: float) -> dict | None:
         idx = cred["auth_index"]
-        if now - self.last_read.get(idx, 0) < READ_GAP_S:
+        gap = FULL_REREAD_S if self.cached_full(cred, now) else READ_GAP_S
+        if now - self.last_read.get(idx, 0) < gap:
             return self.usage_cache.get(idx)
         self.last_read[idx] = now
         code, body = self.p.anthropic(idx, "GET", USAGE_PATH, timeout=12)
