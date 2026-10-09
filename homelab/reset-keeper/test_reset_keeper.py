@@ -212,6 +212,41 @@ class Http(unittest.TestCase):
         k = Keeper(FakeProxy(), S, os.path.join(tempfile.mkdtemp(), "state.json"))
         k.set_auto(False)
         k.tick()
-        self.assertEqual(calls, ["GET"])  # read only, no claim POST
+        self.assertNotIn("POST", calls)  # reads only, no claim
         self.assertIn("would reset (manual mode)", k.view["accounts"][0]["note"])
         self.assertEqual(k.state["attempted"], [])
+
+
+class Schedule(unittest.TestCase):
+    def test_one_read_per_pass_and_backoff_after_429(self):
+        import os
+        import tempfile
+
+        from reset_keeper import RATE_LIMIT_BACKOFF_S, REFRESH_S, Keeper
+
+        reads = []
+
+        class FakeProxy:
+            answer = 200
+
+            def anthropic(self, idx, method, path, body=None, timeout=25):
+                if "usage" in path:
+                    reads.append(idx)
+                    return (200, usage()) if FakeProxy.answer == 200 else (429, None)
+                return 200, {"organization": {"uuid": "x"}}
+
+        k = Keeper(FakeProxy(), S, os.path.join(tempfile.mkdtemp(), "state.json"))
+        creds = [{"name": f"claude-{n}.json", "auth_index": n} for n in ("a", "b", "c")]
+        for t in range(3):
+            k.read_due(creds, NOW + t)
+        self.assertEqual(reads, ["a", "b", "c"])  # spread out, one per pass
+        k.read_due(creds, NOW + 10)
+        self.assertEqual(len(reads), 3)  # nothing due before REFRESH_S
+        FakeProxy.answer = 429
+        k.read_due(creds, NOW + REFRESH_S + 1)
+        self.assertEqual(reads[-1], "a")
+        for t in range(2, 6):
+            k.read_due(creds, NOW + REFRESH_S + t)
+        self.assertNotIn("a", reads[4:])  # a is backing off
+        self.assertGreater(k.backoff["a"], NOW + REFRESH_S + RATE_LIMIT_BACKOFF_S - 5)
+        self.assertEqual(set(k.usage()["accounts"]), {"a", "b", "c"})  # last good copies served

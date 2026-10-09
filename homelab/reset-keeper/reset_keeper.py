@@ -63,6 +63,11 @@ READ_GAP_S = 200
 # A used-up weekly window stays used up until its fixed end date, so re-reading it often
 # only spends the per-account read budget the dashboard also needs.
 FULL_REREAD_S = 15 * 60
+# The keeper is the only reader of Anthropic's usage page; the dashboard takes its copy.
+# One account per tick, each about every 10 min, so 8 accounts never burst.
+REFRESH_S = 10 * 60
+RATE_LIMIT_BACKOFF_S = 5 * 60
+PROFILE_REFRESH_S = 24 * 3600
 IMMINENT_EXPIRY_S = 5 * 60
 
 
@@ -339,8 +344,11 @@ class Keeper:
         self.burn_saved_at = 0.0
         self.last_read: dict[str, float] = {}
         self.usage_cache: dict[str, dict] = {}
+        self.read_at: dict[str, float] = {}
+        self.backoff: dict[str, float] = {}
+        self.profiles: dict[str, dict] = {}
+        self.profile_at: dict[str, float] = {}
         self.state.setdefault("auto", s.enabled)
-        self.state["last_salvage_at"] = 0  # read every account on start so the dashboard has rows
         self.lock = threading.Lock()
         self.view: dict = {"accounts": [], "updated_at": None}
 
@@ -367,17 +375,36 @@ class Keeper:
             json.dump(self.state, f, indent=1)
         os.replace(tmp, self.state_path)
 
-    def read_usage(self, cred: dict, now: float) -> dict | None:
+    def read_due(self, creds: list[dict], now: float) -> None:
+        """Reads at most one account: the stalest one that is due and not backing off."""
+        def due(c: dict) -> bool:
+            idx = c["auth_index"]
+            if now < self.backoff.get(idx, 0):
+                return False
+            age = now - self.last_read.get(idx, 0)
+            if age >= REFRESH_S:
+                return True
+            # The proxy just saw this account hit its weekly limit: confirm it soon.
+            return age >= READ_GAP_S and weekly_full(c, now) and not self.cached_full(c, now)
+        candidates = sorted((c for c in creds if due(c)), key=lambda c: self.last_read.get(c["auth_index"], 0))
+        if candidates:
+            self.read_account(candidates[0], now)
+
+    def read_account(self, cred: dict, now: float) -> dict | None:
         idx = cred["auth_index"]
-        gap = FULL_REREAD_S if self.cached_full(cred, now) else READ_GAP_S
-        if now - self.last_read.get(idx, 0) < gap:
-            return self.usage_cache.get(idx)
         self.last_read[idx] = now
         code, body = self.p.anthropic(idx, "GET", USAGE_PATH, timeout=12)
+        if code == 429:
+            self.backoff[idx] = now + RATE_LIMIT_BACKOFF_S
         if code != 200 or not isinstance(body, dict):
             self.log("read-failed", account=cred["name"], status=code)
             return None
         self.usage_cache[idx] = body
+        self.read_at[idx] = now
+        if now - self.profile_at.get(idx, 0) >= PROFILE_REFRESH_S:
+            pcode, profile = self.p.anthropic(idx, "GET", "/api/oauth/profile", timeout=12)
+            if pcode == 200 and isinstance(profile, dict):
+                self.profiles[idx], self.profile_at[idx] = profile, now
         return body
 
     def spend(self, sp: Spend) -> None:
@@ -435,21 +462,15 @@ class Keeper:
             self.log("pool", serving=len(serving), of=len(creds), reserve_percent=reserve,
                      accounts=[n.removeprefix("claude-").removesuffix(".json") for n in sorted(serving)])
         self.learn(creds)
+        self.read_due(creds, now)
         salvage_due = now - self.state["last_salvage_at"] >= self.s.salvage_every_minutes * 60
-        # Only accounts the proxy already sees at 100% weekly are worth asking Anthropic about.
-        to_read = creds if salvage_due else [c for c in creds if weekly_full(c, now) or self.cached_full(c, now)]
-        if not to_read:
-            return
         if salvage_due:
             self.state["last_salvage_at"] = now
             self.save()
         top = max((c.get("priority") or 0) for c in creds)
-        accounts = []
-        for c in to_read:
-            usage = self.read_usage(c, now)
-            if usage:
-                accounts.append(Account(c["name"].removeprefix("claude-").removesuffix(".json"), c["auth_index"],
-                                        top > 0 and (c.get("priority") or 0) == top, usage))
+        accounts = [Account(c["name"].removeprefix("claude-").removesuffix(".json"), c["auth_index"],
+                            top > 0 and (c.get("priority") or 0) == top, self.usage_cache[c["auth_index"]])
+                    for c in creds if c["auth_index"] in self.usage_cache]
         result = plan(accounts, self.s, now, salvage_due, set(self.state["attempted"]), self.burn_s())
         if salvage_due:
             b = self.state.get("burn") or {}
@@ -534,6 +555,13 @@ class Keeper:
                 "burn_learned": b.get("five_hour", 0) >= 0.5, "spends": self.state.get("spends", [])[-20:],
                 **self.view}
 
+    def usage(self) -> dict:
+        """The keeper's latest Anthropic usage answer per account (the dashboard reads this)."""
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="seconds")  # noqa: E731
+        return {"accounts": {idx: {"read_at": iso(self.read_at[idx]), "usage": body,
+                                   "profile": self.profiles.get(idx)}
+                             for idx, body in self.usage_cache.items() if idx in self.read_at}}
+
     def serve(self, key: str, port: int) -> None:
         keeper = self
 
@@ -556,11 +584,11 @@ class Keeper:
                 self._send(204)
 
             def do_GET(self):
-                if self.path != "/status":
+                if self.path not in ("/status", "/usage"):
                     return self._send(404, {"error": "not found"})
                 if not self._authorized():
                     return self._send(401, {"error": "management key required"})
-                self._send(200, keeper.status())
+                self._send(200, keeper.status() if self.path == "/status" else keeper.usage())
 
             def do_PUT(self):
                 if self.path != "/mode":
